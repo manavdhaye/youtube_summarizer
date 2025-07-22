@@ -1,6 +1,8 @@
 import streamlit as st
 import os
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.formatters import TextFormatter
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 import re
 from openai import OpenAI
 import requests
@@ -8,7 +10,56 @@ from deep_translator import GoogleTranslator
 import subprocess
 import yt_dlp
 from pyvis.network import Network
+import sqlite3
 import json
+
+st.sidebar.title("📜 History")
+
+# Database setup
+conn = sqlite3.connect("youtube_history.db")
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id TEXT UNIQUE,
+        youtube_link TEXT,
+        title TEXT,
+        description TEXT,
+        summary TEXT,
+        timestamp_data TEXT
+    )
+""")
+cursor.execute("SELECT video_id, title FROM history ORDER BY id DESC")
+history_items = cursor.fetchall()
+conn.close()
+
+# Sidebar history buttons
+for vid, title in history_items:
+    if st.sidebar.button(title):
+        st.query_params["video"] = vid  # ✅ REPLACED
+
+# Read from query params
+params = st.query_params  # ✅ REPLACED
+
+if "video" in params:
+    video_id = params["video"]
+    if isinstance(video_id, list):  # In case it's a list
+        video_id = video_id[0]
+    conn = sqlite3.connect("youtube_history.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM history WHERE video_id = ?", (video_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        _, _, youtube_link, title, description, summary, timestamp_data = row
+        st.image(f"http://img.youtube.com/vi/{video_id}/0.jpg")
+        st.markdown(f"### {title}")
+        st.write(summary)
+        st.markdown("### ⏱️ Timestamps with Text")
+        for ts, text in json.loads(timestamp_data):
+            st.markdown(f"[{ts}](https://www.youtube.com/watch?v={video_id}&t={ts.replace(':', '')}s) — {text}")
+
 
 def download_video(url):
   #url = "https://www.youtube.com/watch?v=9He4UBLyk8Y"
@@ -49,24 +100,40 @@ def get_transcript(video_url, lang='en'):
     video_id = extract_video_id(video_url)
     if not video_id:
         return "Invalid YouTube URL!"
-
     try:
-        available_transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-        avilable_langhuage = [t.language_code for t in available_transcripts]
-        print("avilable langhe ====", avilable_langhuage)
-        print(avilable_langhuage[0])
-        # if lang not in [t.language_code for t in available_transcripts]:
-        #     return f"No transcript found for language: {lang}"
+        print("vedeo id =",video_id)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        print("transcript_list",transcript_list)
+        # Print available languages for debugging
+        available_languages = [t.language_code for t in transcript_list]
+        print("Available languages:", available_languages)
 
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[avilable_langhuage[0]])
-        text = " ".join([entry['text'] for entry in transcript])
-        return text
+        # Try preferred language first
+        if lang in available_languages:
+            transcript = transcript_list.find_transcript([lang]).fetch()
+            print("langhague =",lang)
+        else:
+            # Fallback: use first available language
+            transcript = transcript_list.find_transcript(available_languages).fetch()
+            print("langhague =",available_languages)
+
+        # Format transcript as plain text
+        formatter = TextFormatter()
+        text = formatter.format_transcript(transcript)
+        text = text.replace('\n', ' ')  # Remove line breaks
+        return transcript, text
+    except TranscriptsDisabled:
+        return "Transcripts are disabled for this video."
+    except NoTranscriptFound:
+        return "No transcript found for the given language."
     except Exception as e:
         return f"Error: {e}"
+
 
 def lang_translator(transcript,lang):
   translated_text = GoogleTranslator(source='auto', target=lang).translate(transcript)
   return translated_text
+
 
 def get_completion(transcript_text,title,description,language):
   prompt =  f"""Given the following title, description, and transcript from a YouTube video, generate a well-structured and detailed summary in {language}. Identify the category of the video (e.g., coding tutorial, music video, educational content, documentary, or general discussion) and format the summary accordingly:
@@ -87,7 +154,7 @@ Transcript:
 
   client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key="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",
+    api_key="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",
   )
 
   completion = client.chat.completions.create(
@@ -96,7 +163,7 @@ Transcript:
       "X-Title": "<YOUR_SITE_NAME>", # Optional. Site title for rankings on openrouter.ai.
     },
     extra_body={},
-    model="deepseek/deepseek-chat-v3-0324:free",
+    model="deepseek/deepseek-r1:free",
     messages=[
       {
         "role": "user",
@@ -126,7 +193,7 @@ def generate_mind_map_data(transcript_text):
 
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key="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",
+        api_key="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",
     )
 
     try:
@@ -136,7 +203,7 @@ def generate_mind_map_data(transcript_text):
                 "X-Title": "<YOUR_SITE_NAME>",  # Optional. Site title for rankings on openrouter.ai.
             },
             extra_body={},
-            model="deepseek/deepseek-chat-v3-0324:free",
+            model="deepseek/deepseek-r1:free",
             messages=[
                 {
                     "role": "user",
@@ -169,40 +236,6 @@ def generate_mind_map_data(transcript_text):
         return {}  # Return empty dict in case of any other errors
 
 
-# def create_mind_map(topics, output_file="mind_map.html"):
-#     """
-#     Generates an interactive mind map from a YouTube transcript.
-#
-#     Parameters:
-#     - transcript_text (str): Extracted text from YouTube video.
-#     - output_file (str): Name of the output HTML file.
-#
-#     Returns:
-#     - str: Path to the saved HTML file.
-#     """
-#     try:
-#         net = Network(height="750px", width="100%", directed=True)
-#
-#         # Add the main node
-#         parent = "YouTube Video Summary"
-#         net.add_node(parent, label=parent, color="red")
-#
-#         # Add subtopics
-#         for main_topic, subtopics in topics.items():
-#             net.add_node(main_topic, label=main_topic, color="blue")
-#             net.add_edge(parent, main_topic)  # Link to main topic
-#
-#             for sub in subtopics:
-#                 net.add_node(sub, label=sub, color="lightblue")
-#                 net.add_edge(main_topic, sub)  # Link subtopics
-#
-#         # Save the interactive graph
-#         net.write_html(output_file)
-#
-#         return output_file
-#     except Exception as e:
-#         print("Error generating mind map:", str(e))
-#         return None
 
 def create_mind_map(topics, output_file="mind_map.html"):
     """
@@ -244,7 +277,7 @@ def generate_questions(transcript_text):
 
     client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key="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",
+        api_key="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",
     )
 
     completion = client.chat.completions.create(
@@ -253,7 +286,7 @@ def generate_questions(transcript_text):
             "X-Title": "<YOUR_SITE_NAME>",  # Optional. Site title for rankings on openrouter.ai.
         },
         extra_body={},
-        model="deepseek/deepseek-chat-v3-0324:free",
+        model="deepseek/deepseek-r1:free",
         messages=[
             {
                 "role": "user",
@@ -263,9 +296,22 @@ def generate_questions(transcript_text):
     )
     return completion.choices[0].message.content
 
-def extract_timestamps(transcript):
-    timestamps = re.findall(r"\d{1,2}:\d{2}", transcript)
-    return timestamps
+def generate_timestamps(transcript_raw):
+    try:
+        timestamp_data = []
+        for entry in transcript_raw:
+            start_sec = int(entry.start)
+            minutes = start_sec // 60
+            seconds = start_sec % 60
+            timestamp = f"{minutes}:{seconds:02d}"
+            text = entry.text
+            timestamp_data.append((timestamp, text))
+        return timestamp_data
+    except Exception as e:
+        print(f"❌ Error generating timestamps: {e}")
+        return []
+
+
 
 
 dict={'English':'en','Hindi':'hi','Spanish':'es','French':'fr','German':'de','Portuguese':'pt','Russian':'ru','Bengali':'bn','Tamil':'ta','Telugu':'te','Marathi':'mr','Gujarati':'gu','Malayalam':'ml','Kannada':'kn','Punjabi':'pa','Urdu':'ur'}
@@ -275,6 +321,9 @@ language_options = ["English", "Hindi", "Spanish", "French", "German", "Portugue
 st.title("YouTube Transcript to Detailed Notes Converter")
 youtube_link = st.text_input("Enter YouTube Video Link:")
 
+selected_language=''
+video_id=''
+transcript_text=''
 if youtube_link:
     #video_id = youtube_link.split("=")[1]
     #print(video_id)
@@ -291,51 +340,65 @@ if youtube_link:
     else:
         st.error("Failed to load image. Check the video ID or network connection.")
 
-if st.button("Get Detailed Notes"):
-    title, description, length = get_video_details(youtube_link)
-    if length and "Error" in str(length):
-        print(length)  # Print the error message
-    else:
-        print("Title:", title)
-        # print("Description:", description)
-        # print("Length (seconds):", length)
-    transcript_text = get_transcript(youtube_link)
-    print("transcript_text =", transcript_text)
-    if transcript_text:
-        summary = get_completion(transcript_text,title,description,selected_language)
-        st.markdown("## Detailed Notes:")
-        st.write(summary)
-        questions = generate_questions(transcript_text)
-        st.markdown(questions)
-        topics = generate_mind_map_data(transcript_text)
-        print("topics ",topics)
-        mind_map_path = create_mind_map(topics)
-        print(f"✅ Mind map saved at: {mind_map_path}")
-        # Generate mind map HTML
-        if mind_map_path:
-            with open(mind_map_path, "r", encoding="utf-8") as f:
-                html_content = f.read()
-                # Render the mind map in Streamlit
-            st.components.v1.html(html_content, height=750, scrolling=True)
-            st.write(topics)
+    if st.button("Get Detailed Notes"):
+        title, description, length = get_video_details(youtube_link)
+        if length and "Error" in str(length):
+            print(length)  # Print the error message
         else:
-            st.error("Failed to create mind map.")
-        #generate_pdf(vedeo_text,title+""+".pdf")
+            print("Title:", title)
+            print("Description:", description)
+            print("Length (seconds):", length)
+        transcript_raw, transcript_text = get_transcript(youtube_link)
+        print("transcript_text =", transcript_text)
+        if transcript_text:
+            summary = get_completion(transcript_text,title,description,selected_language)
+            st.markdown("## Detailed Notes:")
+            st.write(summary)
+            questions = generate_questions(transcript_text)
+            st.markdown(questions)
+            topics = generate_mind_map_data(transcript_text)
+            print("topics ",topics)
+            mind_map_path = create_mind_map(topics)
+            print(f"✅ Mind map saved at: {mind_map_path}")
+            # Generate mind map HTML
+            if mind_map_path:
+                with open(mind_map_path, "r", encoding="utf-8") as f:
+                    html_content = f.read()
+                    # Render the mind map in Streamlit
+                st.components.v1.html(html_content, height=750, scrolling=True)
+                #st.write(topics)
+            else:
+                st.error("Failed to create mind map.")
 
-        timestamps = extract_timestamps(transcript_text)
-        video_id = extract_video_id(youtube_link)
+            # Inside your `if st.button("Get Detailed Notes"):` block
+            timestamps = generate_timestamps(transcript_raw)
+            if timestamps:
+                st.markdown("### ⏱️ Timestamps with Text")
+                for timestamp, text in timestamps:
+                    yt_link = f"https://www.youtube.com/watch?v={video_id}&t={timestamp.replace(':', '')}s"
+                    st.markdown(f"**[{timestamp}]({yt_link})** — {text}")
+            else:
+                st.warning("No timestamps found or transcript unavailable.")
 
-        for time in timestamps:
-            st.markdown(f"[{time}](https://www.youtube.com/watch?v={video_id}&t={time.replace(':', '')}s)")
+            # Save history into the database
+            conn = sqlite3.connect("youtube_history.db")
+            cursor = conn.cursor()
 
-
-
-
-
-
-
-
-
-
-
-
+            try:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO history (video_id, youtube_link, title, description, summary, timestamp_data)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    video_id,
+                    youtube_link,
+                    title,
+                    description,
+                    summary,
+                    json.dumps(timestamps)  # Save timestamp data as JSON string
+                ))
+                conn.commit()
+                st.success("✅ Video history saved successfully!")
+            except Exception as e:
+                st.warning(f"⚠️ Failed to save video history: {e}")
+            finally:
+                conn.close()
