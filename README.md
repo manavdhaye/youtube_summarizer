@@ -1,6 +1,6 @@
-================================================================================
+--------------------------------------------------------------------------------
 📘 README - YouTube Transcript to Detailed Notes Converter
-================================================================================
+--------------------------------------------------------------------------------
 
 This project is a Streamlit-based web application that allows users to convert any YouTube video into structured, educational content including detailed AI-powered summaries, translated transcripts, interactive mind maps, timestamped notes, and quiz questions.
 
